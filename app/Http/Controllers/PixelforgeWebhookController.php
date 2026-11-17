@@ -5,13 +5,10 @@ namespace App\Http\Controllers;
 use App\Models\Generation;
 use App\Models\User;
 use App\Models\WebhookEvent;
-use App\Services\PixelforgePricing;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
 
 class PixelforgeWebhookController extends Controller
 {
@@ -141,81 +138,16 @@ class PixelforgeWebhookController extends Controller
             $generation->pf_generation_id = $pfGenId;
         }
 
-        $markupPercent = (float) config('services.pixelforge.markup_percent', 25.0);
-
-        switch ($eventType) {
-            case 'generation.processing':
-                if ($generation->canTransitionTo('processing')) {
-                    $generation->status = 'processing';
-                    $generation->started_at = isset($genData['started_at'])
-                        ? Carbon::parse($genData['started_at'])
-                        : now();
-                    $generation->save();
-                }
-                break;
-
-            case 'generation.succeeded':
-                // Final state protection: don't overwrite if already succeeded or failed
-                if ($generation->isFinal() && $generation->status !== 'succeeded') {
-                    break;
-                }
-
-                $usage = $genData['usage'] ?? [];
-                $rates = $genData['rates'] ?? PixelforgePricing::DEFAULT_RATES;
-
-                $calculated = PixelforgePricing::calculateActualCost($usage, $rates, $markupPercent);
-
-                $generation->status = 'succeeded';
-                $generation->image_url = $genData['image_url'] ?? null;
-                $generation->image_url_expires_at = isset($genData['image_url_expires_at'])
-                    ? Carbon::parse($genData['image_url_expires_at'])
-                    : null;
-                $generation->usage = $usage;
-                $generation->rates = $rates;
-                $generation->pf_cost = $calculated['pf_cost'];
-                $generation->user_cost = $calculated['user_cost'];
-                $generation->completed_at = isset($genData['completed_at'])
-                    ? Carbon::parse($genData['completed_at'])
-                    : now();
-                $generation->error_code = null;
-                $generation->error_message = null;
-                $generation->save();
-
-                // Charge user and record transaction if not already charged for this generation
-                $alreadyCharged = $generation->user->creditTransactions()
-                    ->where('reference_id', (string) $generation->id)
-                    ->where('type', 'generation_charge')
-                    ->exists();
-
-                if (! $alreadyCharged && bccomp((string) $generation->user_cost, '0', 9) > 0) {
-                    $generation->user->deductCredits(
-                        $generation->user_cost,
-                        (string) $generation->id,
-                        'Image generation: '.Str::limit($generation->prompt, 40)
-                    );
-                }
-                break;
-
-            case 'generation.failed':
-                // Final state protection: don't overwrite if already succeeded or failed
-                if ($generation->isFinal()) {
-                    break;
-                }
-
-                $error = $genData['error'] ?? [];
-
-                $generation->status = 'failed';
-                $generation->error_code = $error['code'] ?? 'generation_failed';
-                $generation->error_message = $error['message'] ?? 'Image generation failed';
-                $generation->completed_at = isset($genData['completed_at'])
-                    ? Carbon::parse($genData['completed_at'])
-                    : now();
-
-                // Failed generations are completely free
-                $generation->pf_cost = '0.000000000';
-                $generation->user_cost = '0.000000000';
-                $generation->save();
-                break;
+        // Map webhook event type to generation status if not explicitly present
+        if (! isset($genData['status'])) {
+            $genData['status'] = match ($eventType) {
+                'generation.processing' => 'processing',
+                'generation.succeeded' => 'succeeded',
+                'generation.failed' => 'failed',
+                default => 'queued',
+            };
         }
+
+        $generation->applyPixelforgeData($genData);
     }
 }

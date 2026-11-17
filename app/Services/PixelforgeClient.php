@@ -144,24 +144,35 @@ class PixelforgeClient
      */
     public function getGeneration(string $generationId): array
     {
-        $response = Http::timeout($this->timeout)
-            ->withToken($this->apiKey)
-            ->acceptJson()
-            ->get("{$this->baseUrl}/generations/{$generationId}");
+        try {
+            $response = Http::timeout($this->timeout)
+                ->withToken($this->apiKey)
+                ->acceptJson()
+                ->get("{$this->baseUrl}/generations/{$generationId}");
 
-        if ($response->successful()) {
+            if ($response->successful()) {
+                return [
+                    'success' => true,
+                    'status' => $response->status(),
+                    'data' => $response->json(),
+                ];
+            }
+
             return [
-                'success' => true,
+                'success' => false,
                 'status' => $response->status(),
-                'data' => $response->json(),
+                'error' => $this->parseError($response),
+            ];
+        } catch (\Throwable $e) {
+            return [
+                'success' => false,
+                'status' => 0,
+                'error' => [
+                    'code' => 'connection_error',
+                    'message' => $e->getMessage(),
+                ],
             ];
         }
-
-        return [
-            'success' => false,
-            'status' => $response->status(),
-            'error' => $this->parseError($response),
-        ];
     }
 
     /**

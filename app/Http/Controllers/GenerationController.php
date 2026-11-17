@@ -191,10 +191,28 @@ class GenerationController extends Controller
     /**
      * Poll active generations for real-time UI updates.
      */
-    public function poll(Request $request): JsonResponse
+    public function poll(Request $request, PixelforgeClient $client): JsonResponse
     {
         $user = $request->user();
 
+        $activeGenerations = Generation::where('user_id', $user->id)
+            ->whereIn('status', ['queued', 'processing'])
+            ->get();
+
+        // Fallback sync for localhost or delayed webhooks: query Pixelforge API directly
+        foreach ($activeGenerations as $gen) {
+            if ($gen->pf_generation_id) {
+                $remote = $client->getGeneration($gen->pf_generation_id);
+                if (! empty($remote['success']) && ! empty($remote['data'])) {
+                    $remoteData = $remote['data'];
+                    if (in_array($remoteData['status'] ?? '', ['succeeded', 'failed'], true)) {
+                        $gen->applyPixelforgeData($remoteData);
+                    }
+                }
+            }
+        }
+
+        // Re-query active generations after fallback sync
         $activeGenerations = Generation::where('user_id', $user->id)
             ->whereIn('status', ['queued', 'processing'])
             ->get();
