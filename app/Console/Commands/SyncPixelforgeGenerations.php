@@ -8,6 +8,7 @@ use App\Services\PixelforgeClient;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 
 #[Signature('pixelforge:sync {--all : Sync all remote generations from Pixelforge API}')]
 #[Description('Synchronize generation statuses from Pixelforge API')]
@@ -43,6 +44,48 @@ class SyncPixelforgeGenerations extends Command
                 }
             } else {
                 $this->warn("Failed to fetch {$gen->pf_generation_id}: ".($response['error']['message'] ?? 'Unknown error'));
+            }
+        }
+
+        // Reconcile unlinked pending generations (timed out during submission without pf_generation_id)
+        $unlinkedPending = Generation::where('status', 'queued')
+            ->whereNull('pf_generation_id')
+            ->get();
+
+        if ($unlinkedPending->isNotEmpty()) {
+            $this->info("Found {$unlinkedPending->count()} unlinked pending generation(s), reconciling with remote list...");
+            $listResponse = $client->listGenerations(limit: 50);
+            $remoteJobs = collect($listResponse['data']['data'] ?? []);
+
+            foreach ($unlinkedPending as $gen) {
+                // Try matching remote generation by metadata.local_id
+                $matched = $remoteJobs->first(fn ($item) => (string) ($item['metadata']['local_id'] ?? '') === (string) $gen->id);
+
+                if ($matched) {
+                    $gen->pf_generation_id = $matched['id'];
+                    $gen->save();
+                    $gen->applyPixelforgeData($matched);
+                    $this->info("✓ Linked unlinked generation {$gen->id} to {$matched['id']} [{$matched['status']}]");
+                    $updatedCount++;
+                } elseif ($gen->created_at->lt(now()->subMinutes(15))) {
+                    // If after 15 minutes the job never appeared on provider, safely fail and release hold
+                    DB::transaction(function () use ($gen) {
+                        $locked = Generation::whereKey($gen->id)->lockForUpdate()->first();
+                        if ($locked && $locked->status === 'queued') {
+                            $locked->update([
+                                'status' => 'failed',
+                                'error_code' => 'network_timeout_abandoned',
+                                'error_message' => 'Generation was never acknowledged by provider after timeout window.',
+                                'completed_at' => now(),
+                            ]);
+                            $u = User::whereKey($locked->user_id)->lockForUpdate()->first();
+                            if ($locked->hold_amount) {
+                                $u?->releaseCredits($locked->hold_amount);
+                            }
+                        }
+                    });
+                    $this->warn("! Timed out unacknowledged generation {$gen->id} expired and hold released.");
+                }
             }
         }
 

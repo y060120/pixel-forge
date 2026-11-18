@@ -100,13 +100,20 @@ class Generation extends Model
                 return;
             }
 
-            // Both succeeded and failed states are fully final; do not allow re-settlement or regression
-            if ($gen->isFinal()) {
+            $status = $genData['status'] ?? null;
+            $markupPercent = $markupPercent ?? (float) config('services.pixelforge.markup_percent', 25.0);
+
+            // Succeeded state is strictly final and cannot be modified or re-charged.
+            if ($gen->status === 'succeeded') {
                 return;
             }
 
-            $markupPercent = $markupPercent ?? (float) config('services.pixelforge.markup_percent', 25.0);
-            $status = $genData['status'] ?? null;
+            // Failed state cannot regress to processing or queued.
+            // If Pixelforge actually succeeded (e.g. after a client-side timeout),
+            // allow transition to 'succeeded' so the image is delivered and customer is billed.
+            if ($gen->status === 'failed' && $status !== 'succeeded') {
+                return;
+            }
 
             if ($status === 'processing') {
                 if ($gen->canTransitionTo('processing')) {

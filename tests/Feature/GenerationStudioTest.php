@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Generation;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
@@ -234,5 +235,102 @@ class GenerationStudioTest extends TestCase
         $response->assertRedirect(route('generations.index'));
         $this->assertSame(1, Generation::count());
         $this->assertSame('gen_retry_success', Generation::first()->pf_generation_id);
+    }
+
+    public function test_network_timeout_preserves_hold_and_queued_status_to_prevent_free_images(): void
+    {
+        $user = User::factory()->create(['balance' => '5.000000000']);
+
+        Http::fake([
+            '*/v1/generations' => function () {
+                throw new ConnectionException('cURL error 28: Operation timed out');
+            },
+        ]);
+
+        $response = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'Timeout test image',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+
+        $response->assertRedirect(route('generations.index'));
+        $response->assertSessionHas('warning');
+
+        $gen = Generation::first();
+        // Crucial: Must NOT be failed, and hold must NOT be released!
+        $this->assertSame('queued', $gen->status);
+        $this->assertSame('network_timeout_pending', $gen->error_code);
+        $this->assertNotNull($gen->hold_amount);
+
+        $freshUser = $user->fresh();
+        $this->assertSame((string) $gen->hold_amount, (string) $freshUser->reserved_balance);
+
+        // Now simulate the provider finishing in background and delivering succeeded webhook
+        $gen->applyPixelforgeData([
+            'id' => 'gen_timed_out_but_succeeded_on_provider',
+            'status' => 'succeeded',
+            'image_url' => 'https://pixelforge.promptedit.dev/images/saved.png',
+            'usage' => [
+                'input_text_tokens' => 20,
+                'input_image_tokens' => 0,
+                'output_tokens' => 1100,
+                'reasoning_tokens' => 200,
+            ],
+            'rates' => [
+                'input_text_tokens' => '5.00',
+                'input_image_tokens' => '10.00',
+                'output_tokens' => '40.00',
+                'reasoning_tokens' => '12.50',
+            ],
+        ]);
+
+        $freshGen = $gen->fresh();
+        $this->assertSame('succeeded', $freshGen->status);
+        $this->assertSame('https://pixelforge.promptedit.dev/images/saved.png', $freshGen->image_url);
+
+        // User must be charged and hold released!
+        $this->assertSame('0.000000000', $user->fresh()->reserved_balance);
+        $this->assertSame(1, $user->creditTransactions()->where('type', 'generation_charge')->count());
+    }
+
+    public function test_succeeded_event_recovers_and_bills_job_even_if_previously_marked_failed(): void
+    {
+        $user = User::factory()->create(['balance' => '5.000000000']);
+        $gen = Generation::create([
+            'user_id' => $user->id,
+            'pf_generation_id' => 'gen_prematurely_failed',
+            'prompt' => 'Premature failure recovery test',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+            'status' => 'failed',
+            'error_code' => 'connection_error',
+            'pf_cost' => '0.000000000',
+            'user_cost' => '0.000000000',
+        ]);
+
+        // Belated succeeded event arrives from provider
+        $gen->applyPixelforgeData([
+            'id' => 'gen_prematurely_failed',
+            'status' => 'succeeded',
+            'image_url' => 'https://pixelforge.promptedit.dev/images/recovered.png',
+            'usage' => [
+                'input_text_tokens' => 20,
+                'input_image_tokens' => 0,
+                'output_tokens' => 1100,
+                'reasoning_tokens' => 200,
+            ],
+            'rates' => [
+                'input_text_tokens' => '5.00',
+                'input_image_tokens' => '10.00',
+                'output_tokens' => '40.00',
+                'reasoning_tokens' => '12.50',
+            ],
+        ]);
+
+        $freshGen = $gen->fresh();
+        $this->assertSame('succeeded', $freshGen->status);
+        $this->assertSame('https://pixelforge.promptedit.dev/images/recovered.png', $freshGen->image_url);
+        // User must be charged
+        $this->assertSame(1, $user->creditTransactions()->where('type', 'generation_charge')->count());
     }
 }

@@ -193,11 +193,30 @@ class GenerationController extends Controller
             return redirect()->route('generations.index')->with('success', 'Image generation requested successfully.');
         }
 
-        // Handle Pixelforge rejection or connection error: mark failed and release hold
         $err = $result['error'] ?? [];
         $code = $err['code'] ?? 'unknown_error';
         $message = $err['message'] ?? 'Failed to submit generation to Pixelforge.';
+        $status = (int) ($result['status'] ?? 0);
 
+        // Ambiguous Network Failure / Timeout (status 0):
+        // Pixelforge may have received the request and started generating.
+        // DO NOT mark failed and DO NOT release hold to avoid giving away free images!
+        // The job remains queued and will be linked/settled by incoming webhooks or scheduled sync.
+        if ($status === 0 || $code === 'connection_error' || $code === 'timeout') {
+            $generation->update([
+                'error_code' => 'network_timeout_pending',
+                'error_message' => 'Network confirmation timed out. Awaiting webhook or background sync verification.',
+            ]);
+
+            return redirect()->route('generations.index')->with(
+                'warning',
+                'Generation submitted, but network confirmation timed out. Your job remains queued with credits held while awaiting provider completion.'
+            );
+        }
+
+        // Definitive Provider Rejection (HTTP 4xx):
+        // Pixelforge explicitly rejected the request (e.g., content policy or validation error).
+        // Safely mark failed and release the hold.
         DB::transaction(function () use ($generation, $user, $maxRequired, $code, $message) {
             $gen = Generation::whereKey($generation->id)->lockForUpdate()->first();
             if ($gen && ! $gen->isFinal()) {

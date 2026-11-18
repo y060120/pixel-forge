@@ -10,10 +10,10 @@
 
 ---
 
-## 🌐 Live URL & Deployment
+## 🌐 Live Application URL
 
-- **Live URL**: `https://pixelforge.promptedit.dev` (or your configured Laravel Cloud deployment domain)
-- **Webhook Endpoint**: `https://<your-domain>/webhooks/pixelforge`
+- **Live URL**: `https://<your-deployed-domain>` *(replace with your deployed domain on Laravel Cloud, Railway, or Render)*
+- **Webhook Endpoint**: `https://<your-deployed-domain>/webhooks/pixelforge`
 
 ---
 
@@ -47,6 +47,13 @@
 
 ### 5. Webhook Security & Strict Secret Configuration
 - **Decision**: The webhook receiver requires valid HMAC-SHA256 signatures (`Pixelforge-Signature`), verifies timestamp tolerance (300 seconds) against replay attacks, and immediately returns `500 Internal Server Error` if `PIXELFORGE_WEBHOOK_SECRET` is not configured in production rather than silently bypassing verification.
+
+### 6. Ambiguous Network Timeout Safety (Zero Free Generations)
+- **Problem**: When a generation request times out during HTTP submission, treating it as an immediate rejection and releasing the credit hold would give away free images if Pixelforge actually received the request and later delivers the image via webhook.
+- **Decision**:
+  - Network timeouts (`status === 0`) leave the generation in `queued` with the credit hold preserved, while notifying the user that verification is pending.
+  - The scheduled sync (`pixelforge:sync`) and incoming webhooks correlate the job via `metadata.local_id`.
+  - In `applyPixelforgeData()`, if a verified `generation.succeeded` event arrives for any previously unbilled generation, it safely transitions to `succeeded`, delivers the image, and bills the customer. The platform is never left paying the provider for an unbilled generation.
 
 ---
 
@@ -226,13 +233,23 @@ Test coverage includes:
 
 ---
 
-## ☁️ Production Deployment (Laravel Cloud)
+## ☁️ Production Deployment
 
-PixelForge is designed to deploy to [Laravel Cloud](https://cloud.laravel.com):
+### Option A: Laravel Cloud
 - **Build Command**: `composer install --no-dev --optimize-autoloader && npm install && npm run build`
 - **Deploy Command**: `php artisan migrate --force`
 - **Database**: Managed PostgreSQL cluster.
 - **Webhook URL**: Set `https://<your-app-domain>/webhooks/pixelforge` in your Pixelforge dashboard.
+
+### Option B: Railway / Render
+- **Build Command**: `composer install --no-dev --optimize-autoloader && npm install && npm run build`
+- **Start Command**: `php artisan serve --host=0.0.0.0 --port=$PORT`
+- **Release / Deploy Command**: `php artisan migrate --force`
+- **Environment Variables**:
+  - `APP_KEY`, `APP_ENV=production`, `APP_DEBUG=false`
+  - `DB_CONNECTION=pgsql`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` (or `DATABASE_URL`)
+  - `PIXELFORGE_API_KEY`, `PIXELFORGE_WEBHOOK_SECRET`
+  - `ADMIN_EMAIL`, `ADMIN_PASSWORD` (for administrative setup)
 
 ---
 
