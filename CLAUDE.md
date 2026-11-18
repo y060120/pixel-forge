@@ -185,7 +185,8 @@ Vue components must have a single root element.
 - **Credit Holds & Overdrafts**: When submitting generations, always place a hold on `reserved_balance` under a pessimistic row lock (`lockForUpdate()`) to prevent concurrent overdrafts. Release the hold upon generation completion (success or failure). Available balance is `balance - reserved_balance`.
 - **Exactly-Once Settlement**: Always settle generation status transitions and credit charges inside a database transaction with `Generation::whereKey($id)->lockForUpdate()->first()`.
 - **Database Unique Constraint**: `credit_transactions` enforces a unique index on `(type, reference_id)`. Never attempt to bypass or drop this constraint.
-- **Terminal States**: `succeeded` and `failed` statuses are strictly terminal and immutable. Duplicate or out-of-order events MUST NOT alter costs, images, or trigger duplicate deductions.
+- **Terminal States**: `succeeded` is strictly final and immutable. Never allow regressions or duplicate deductions.
+- **Ambiguous Timeouts**: Network timeouts during generation submission must preserve the `queued` status and credit hold, preventing free image leaks if the provider asynchronously completes the job.
 - **Admin Authorization**: Any operator or administrative route (`/admin/report`, etc.) MUST be protected by the `view-admin-report` gate (`Gate::authorize('view-admin-report')`).
 - **Webhook Security**: Webhook endpoints must strictly enforce HMAC-SHA256 signatures with 300s timestamp tolerance. If `PIXELFORGE_WEBHOOK_SECRET` is not configured, abort with HTTP 500 immediately.
 - **Rate Limits & Overloads**: Respect upstream provider HTTP 429 and 503 responses with exponential backoff and `Retry-After` headers.
