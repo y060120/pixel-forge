@@ -177,4 +177,19 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 Vue components must have a single root element.
 - IMPORTANT: Activate `inertia-vue-development` when working with Inertia Vue client-side patterns.
 
+=== pixelforge rules ===
+
+# PixelForge Core Architecture & Money Invariants
+
+- **Financial Precision**: All monetary calculations MUST use 9 decimals (`decimal(18, 9)`) with PHP `bcmath` functions (`bcadd`, `bcsub`, `bcmul`, `bcdiv`, `bccomp`). Never cast money values to `(float)`. Truncate intermediate calculations at 9 decimal places. Format to 4 decimal places for UI display.
+- **Credit Holds & Overdrafts**: When submitting generations, always place a hold on `reserved_balance` under a pessimistic row lock (`lockForUpdate()`) to prevent concurrent overdrafts. Release the hold upon generation completion (success or failure). Available balance is `balance - reserved_balance`.
+- **Exactly-Once Settlement**: Always settle generation status transitions and credit charges inside a database transaction with `Generation::whereKey($id)->lockForUpdate()->first()`.
+- **Database Unique Constraint**: `credit_transactions` enforces a unique index on `(type, reference_id)`. Never attempt to bypass or drop this constraint.
+- **Terminal States**: `succeeded` and `failed` statuses are strictly terminal and immutable. Duplicate or out-of-order events MUST NOT alter costs, images, or trigger duplicate deductions.
+- **Admin Authorization**: Any operator or administrative route (`/admin/report`, etc.) MUST be protected by the `view-admin-report` gate (`Gate::authorize('view-admin-report')`).
+- **Webhook Security**: Webhook endpoints must strictly enforce HMAC-SHA256 signatures with 300s timestamp tolerance. If `PIXELFORGE_WEBHOOK_SECRET` is not configured, abort with HTTP 500 immediately.
+- **Rate Limits & Overloads**: Respect upstream provider HTTP 429 and 503 responses with exponential backoff and `Retry-After` headers.
+- **Polling vs. Provider Sync**: Browser polling (`/generations/poll`) reads internal database records only. Never call external provider APIs in polling loops. External synchronization is owned by webhooks and the scheduled `pixelforge:sync` Artisan command.
+- **Environment Fallback**: When running outside Docker/Sail on host without PostgreSQL running, use `DB_CONNECTION=sqlite DB_DATABASE=database/database.sqlite` for Artisan/Tinker.
+
 </laravel-boost-guidelines>
