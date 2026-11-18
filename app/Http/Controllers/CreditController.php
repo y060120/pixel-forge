@@ -17,7 +17,8 @@ class CreditController extends Controller
             'amount' => ['required', 'numeric', 'min:1', 'max:1000'],
         ]);
 
-        $amount = number_format((float) $validated['amount'], 4, '.', '');
+        // Format to exact decimal without float casting
+        $amount = bcadd((string) $validated['amount'], '0', 4);
         $user = $request->user();
 
         $user->addCredits(

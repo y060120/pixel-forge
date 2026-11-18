@@ -3,11 +3,13 @@
 namespace App\Http\Controllers;
 
 use App\Models\Generation;
+use App\Models\User;
 use App\Services\PixelforgeClient;
 use App\Services\PixelforgePricing;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -65,7 +67,7 @@ class GenerationController extends Controller
     /**
      * Live cost estimation endpoint for the interactive UI form.
      */
-    public function estimate(Request $request): JsonResponse
+    public function estimate(Request $request, PixelforgeClient $client): JsonResponse
     {
         $prompt = (string) $request->input('prompt', '');
         $size = (string) $request->input('size', '1024x1024');
@@ -73,12 +75,15 @@ class GenerationController extends Controller
         $refImages = (array) $request->input('reference_images', []);
         $refCount = count(array_filter($refImages));
 
+        $pricing = $client->getPricing();
+        $rates = $pricing['rates'] ?? PixelforgePricing::DEFAULT_RATES;
+
         $estimate = PixelforgePricing::estimateCost(
             $prompt,
             $size,
             $quality,
             $refCount,
-            null,
+            $rates,
             (float) config('services.pixelforge.markup_percent', 25.0)
         );
 
@@ -87,6 +92,7 @@ class GenerationController extends Controller
 
     /**
      * Submit a new generation request.
+     * Atomically reserves a credit hold under user row lock before submission.
      */
     public function store(Request $request, PixelforgeClient $client): RedirectResponse
     {
@@ -103,47 +109,63 @@ class GenerationController extends Controller
         $quality = $validated['quality'] ?? 'medium';
         $refImages = array_values(array_filter($validated['reference_images'] ?? []));
 
-        // Upfront pricing estimate
+        // Upfront pricing estimate using live provider rates
+        $pricing = $client->getPricing();
+        $rates = $pricing['rates'] ?? PixelforgePricing::DEFAULT_RATES;
         $markupPercent = (float) config('services.pixelforge.markup_percent', 25.0);
+
         $estimate = PixelforgePricing::estimateCost(
             $validated['prompt'],
             $size,
             $quality,
             count($refImages),
-            null,
+            $rates,
             $markupPercent
         );
 
         $maxRequired = $estimate['user_cost']['max'];
 
-        // Balance validation: block generation if user cannot afford max potential cost
-        if (! $user->hasSufficientBalance($maxRequired)) {
+        // Reserve hold atomically under row lock to prevent overdraft race conditions
+        $generation = DB::transaction(function () use ($user, $validated, $size, $quality, $refImages, $estimate, $maxRequired) {
+            /** @var User|null $lockedUser */
+            $lockedUser = User::whereKey($user->id)->lockForUpdate()->first();
+
+            if (! $lockedUser || ! $lockedUser->hasSufficientBalance($maxRequired)) {
+                return null;
+            }
+
+            $lockedUser->reserveCredits($maxRequired);
+
+            $idempotencyKey = (string) Str::uuid();
+
+            return Generation::create([
+                'user_id' => $lockedUser->id,
+                'idempotency_key' => $idempotencyKey,
+                'prompt' => $validated['prompt'],
+                'size' => $size,
+                'quality' => $quality,
+                'reference_images' => $refImages,
+                'metadata' => [
+                    'user_id' => (string) $lockedUser->id,
+                ],
+                'status' => 'queued',
+                'estimated_cost' => $estimate['user_cost']['expected'],
+                'hold_amount' => $maxRequired,
+                'rates' => $estimate['rates'],
+            ]);
+        });
+
+        if (! $generation) {
+            $freshUser = $user->fresh();
+
             return back()->withErrors([
                 'balance' => sprintf(
-                    'Insufficient credits balance. This generation could cost up to $%s, but your balance is $%s. Please top up your balance first.',
+                    'Insufficient credits balance. This generation could cost up to $%s, but your available balance is $%s. Please top up your balance first.',
                     number_format((float) $maxRequired, 4),
-                    number_format((float) $user->balance, 4)
+                    number_format((float) ($freshUser ? $freshUser->availableBalance() : 0), 4)
                 ),
             ]);
         }
-
-        $idempotencyKey = (string) Str::uuid();
-
-        // Create local pending record
-        $generation = Generation::create([
-            'user_id' => $user->id,
-            'idempotency_key' => $idempotencyKey,
-            'prompt' => $validated['prompt'],
-            'size' => $size,
-            'quality' => $quality,
-            'reference_images' => $refImages,
-            'metadata' => [
-                'user_id' => (string) $user->id,
-            ],
-            'status' => 'queued',
-            'estimated_cost' => $estimate['user_cost']['expected'],
-            'rates' => $estimate['rates'],
-        ]);
 
         // Put local_id in metadata so early webhooks can correlate
         $params = [
@@ -158,7 +180,7 @@ class GenerationController extends Controller
         ];
 
         // Call Pixelforge API
-        $result = $client->createGeneration($params, $idempotencyKey);
+        $result = $client->createGeneration($params, $generation->idempotency_key);
 
         if ($result['success']) {
             $pfData = $result['data'];
@@ -171,48 +193,40 @@ class GenerationController extends Controller
             return redirect()->route('generations.index')->with('success', 'Image generation requested successfully.');
         }
 
-        // Handle Pixelforge rejection/errors
+        // Handle Pixelforge rejection or connection error: mark failed and release hold
         $err = $result['error'] ?? [];
         $code = $err['code'] ?? 'unknown_error';
         $message = $err['message'] ?? 'Failed to submit generation to Pixelforge.';
 
-        $generation->update([
-            'status' => 'failed',
-            'error_code' => $code,
-            'error_message' => $message,
-            'pf_cost' => '0.000000000',
-            'user_cost' => '0.000000000',
-            'completed_at' => now(),
-        ]);
+        DB::transaction(function () use ($generation, $user, $maxRequired, $code, $message) {
+            $gen = Generation::whereKey($generation->id)->lockForUpdate()->first();
+            if ($gen && ! $gen->isFinal()) {
+                $gen->update([
+                    'status' => 'failed',
+                    'error_code' => $code,
+                    'error_message' => $message,
+                    'pf_cost' => '0.000000000',
+                    'user_cost' => '0.000000000',
+                    'completed_at' => now(),
+                ]);
+
+                /** @var User|null $u */
+                $u = User::whereKey($user->id)->lockForUpdate()->first();
+                $u?->releaseCredits($maxRequired);
+            }
+        });
 
         return redirect()->route('generations.index')->with('error', "Pixelforge error: {$message}");
     }
 
     /**
      * Poll active generations for real-time UI updates.
+     * Reads directly from database to prevent external rate-limit exhaustion.
      */
-    public function poll(Request $request, PixelforgeClient $client): JsonResponse
+    public function poll(Request $request): JsonResponse
     {
         $user = $request->user();
 
-        $activeGenerations = Generation::where('user_id', $user->id)
-            ->whereIn('status', ['queued', 'processing'])
-            ->get();
-
-        // Fallback sync for localhost or delayed webhooks: query Pixelforge API directly
-        foreach ($activeGenerations as $gen) {
-            if ($gen->pf_generation_id) {
-                $remote = $client->getGeneration($gen->pf_generation_id);
-                if (! empty($remote['success']) && ! empty($remote['data'])) {
-                    $remoteData = $remote['data'];
-                    if (in_array($remoteData['status'] ?? '', ['succeeded', 'failed'], true)) {
-                        $gen->applyPixelforgeData($remoteData);
-                    }
-                }
-            }
-        }
-
-        // Re-query active generations after fallback sync
         $activeGenerations = Generation::where('user_id', $user->id)
             ->whereIn('status', ['queued', 'processing'])
             ->get();
@@ -224,6 +238,7 @@ class GenerationController extends Controller
             ->get();
 
         $allGenerations = $activeGenerations->concat($recentlyFinished)->unique('id')->values();
+        $freshUser = $user->fresh();
 
         return response()->json([
             'generations' => $allGenerations->map(fn ($gen) => [
@@ -243,7 +258,8 @@ class GenerationController extends Controller
                 'updated_at' => $gen->updated_at->toIso8601String(),
             ]),
             'active_count' => $activeGenerations->count(),
-            'user_balance' => $user->fresh()->balance,
+            'user_balance' => $freshUser ? $freshUser->balance : '0.000000000',
+            'available_balance' => $freshUser ? $freshUser->availableBalance() : '0.000000000',
         ]);
     }
 }

@@ -254,4 +254,137 @@ class WebhookTest extends TestCase
         // Must still be succeeded!
         $this->assertSame('succeeded', $generation->fresh()->status);
     }
+
+    public function test_rejects_when_webhook_secret_is_not_configured(): void
+    {
+        Config::set('services.pixelforge.webhook_secret', null);
+
+        $payload = json_encode(['id' => 'evt_nosecret', 'type' => 'ping']);
+        $headers = [
+            'Content-Type' => 'application/json',
+            'Pixelforge-Signature' => 't='.time().',v1=dummy',
+        ];
+
+        $response = $this->call('POST', '/webhooks/pixelforge', [], [], [], $this->transformHeadersToServerVars($headers), $payload);
+        $response->assertStatus(500);
+    }
+
+    public function test_duplicate_succeeded_event_charges_exactly_once_and_preserves_final_state(): void
+    {
+        $user = User::factory()->create([
+            'balance' => '10.000000000',
+            'reserved_balance' => '0.500000000',
+        ]);
+
+        $generation = Generation::create([
+            'user_id' => $user->id,
+            'pf_generation_id' => 'gen_dup_charge_1',
+            'prompt' => 'Duplicate settlement test',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+            'hold_amount' => '0.500000000',
+            'status' => 'processing',
+        ]);
+
+        $payloadData = [
+            'id' => 'evt_settle_once_1',
+            'type' => 'generation.succeeded',
+            'data' => [
+                'object' => [
+                    'id' => 'gen_dup_charge_1',
+                    'status' => 'succeeded',
+                    'usage' => [
+                        'input_text_tokens' => 10,
+                        'input_image_tokens' => 0,
+                        'output_tokens' => 1000,
+                        'reasoning_tokens' => 0,
+                    ],
+                    'rates' => [
+                        'input_text_tokens' => '5.00',
+                        'input_image_tokens' => '10.00',
+                        'output_tokens' => '40.00',
+                        'reasoning_tokens' => '12.50',
+                    ],
+                ],
+            ],
+        ];
+
+        $payload = json_encode($payloadData);
+        $headers = $this->createSignedHeaders($payload);
+
+        // First delivery
+        $response1 = $this->call('POST', '/webhooks/pixelforge', [], [], [], $this->transformHeadersToServerVars($headers), $payload);
+        $response1->assertNoContent();
+
+        $freshGen = $generation->fresh();
+        $this->assertSame('succeeded', $freshGen->status);
+        $userCost = $freshGen->user_cost;
+
+        // User charged once and hold released
+        $this->assertSame('0.000000000', $user->fresh()->reserved_balance);
+        $this->assertSame(1, $user->creditTransactions()->where('type', 'generation_charge')->count());
+
+        // Attempting to settle again via direct method call (simulating simultaneous poll / sync race)
+        $freshGen->applyPixelforgeData($payloadData['data']['object']);
+
+        // Assert strictly exactly one charge occurred and balance did not double-deduct
+        $this->assertSame(1, $user->creditTransactions()->where('type', 'generation_charge')->count());
+        $expectedBalance = bcsub('10.000000000', $userCost, 9);
+        $this->assertSame($expectedBalance, $user->fresh()->balance);
+    }
+
+    public function test_early_webhook_arrival_links_and_settles_generation_via_local_id_metadata(): void
+    {
+        $user = User::factory()->create(['balance' => '5.000000000', 'reserved_balance' => '0.200000000']);
+
+        // Local generation row created, but POST request hasn't set pf_generation_id yet
+        $generation = Generation::create([
+            'user_id' => $user->id,
+            'pf_generation_id' => null,
+            'prompt' => 'Early webhook test prompt',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+            'hold_amount' => '0.200000000',
+            'status' => 'queued',
+        ]);
+
+        $payloadData = [
+            'id' => 'evt_early_arrival_1',
+            'type' => 'generation.succeeded',
+            'data' => [
+                'object' => [
+                    'id' => 'gen_early_remote_999',
+                    'status' => 'succeeded',
+                    'metadata' => [
+                        'user_id' => (string) $user->id,
+                        'local_id' => (string) $generation->id,
+                    ],
+                    'usage' => [
+                        'input_text_tokens' => 20,
+                        'input_image_tokens' => 0,
+                        'output_tokens' => 1100,
+                        'reasoning_tokens' => 200,
+                    ],
+                    'rates' => [
+                        'input_text_tokens' => '5.00',
+                        'input_image_tokens' => '10.00',
+                        'output_tokens' => '40.00',
+                        'reasoning_tokens' => '12.50',
+                    ],
+                ],
+            ],
+        ];
+
+        $payload = json_encode($payloadData);
+        $headers = $this->createSignedHeaders($payload);
+
+        $response = $this->call('POST', '/webhooks/pixelforge', [], [], [], $this->transformHeadersToServerVars($headers), $payload);
+        $response->assertNoContent();
+
+        $freshGen = $generation->fresh();
+        $this->assertSame('succeeded', $freshGen->status);
+        $this->assertSame('gen_early_remote_999', $freshGen->pf_generation_id);
+        $this->assertSame('0.000000000', $user->fresh()->reserved_balance);
+        $this->assertSame(1, $user->creditTransactions()->where('type', 'generation_charge')->count());
+    }
 }

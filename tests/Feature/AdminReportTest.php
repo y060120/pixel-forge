@@ -14,13 +14,13 @@ class AdminReportTest extends TestCase
 
     public function test_admin_report_renders_and_reconciles_with_pixelforge_usage(): void
     {
-        $user = User::factory()->create();
+        $admin = User::factory()->admin()->create();
 
         $completedDate = now()->format('Y-m-d');
 
         // Create a completed generation in the database
         Generation::create([
-            'user_id' => $user->id,
+            'user_id' => $admin->id,
             'pf_generation_id' => 'gen_reconcile_1',
             'prompt' => 'Reconciliation test',
             'status' => 'succeeded',
@@ -57,7 +57,7 @@ class AdminReportTest extends TestCase
             ], 200),
         ]);
 
-        $response = $this->actingAs($user)->get(route('admin.report', [
+        $response = $this->actingAs($admin)->get(route('admin.report', [
             'start_date' => $completedDate,
             'end_date' => $completedDate,
         ]));
@@ -72,5 +72,21 @@ class AdminReportTest extends TestCase
                 ->where('totals.provider_cost', '0.100000000')
                 ->where('totals.profit', '0.025000000')
             );
+    }
+
+    public function test_non_admin_cannot_access_admin_report(): void
+    {
+        $user = User::factory()->create(['is_admin' => false]);
+
+        $response = $this->actingAs($user)->get(route('admin.report'));
+
+        $response->assertForbidden();
+    }
+
+    public function test_unauthenticated_user_redirected_to_login(): void
+    {
+        $response = $this->get(route('admin.report'));
+
+        $response->assertRedirect(route('login'));
     }
 }

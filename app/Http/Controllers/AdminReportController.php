@@ -8,6 +8,7 @@ use App\Services\PixelforgeClient;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -18,6 +19,8 @@ class AdminReportController extends Controller
      */
     public function index(Request $request, PixelforgeClient $client): Response
     {
+        Gate::authorize('view-admin-report');
+
         $startDate = $request->query('start_date', now()->subDays(14)->format('Y-m-d'));
         $endDate = $request->query('end_date', now()->format('Y-m-d'));
 

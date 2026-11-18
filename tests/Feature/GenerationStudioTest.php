@@ -112,4 +112,127 @@ class GenerationStudioTest extends TestCase
         $this->assertSame('27.000000000', $user->fresh()->balance);
         $this->assertSame(1, $user->creditTransactions()->count());
     }
+
+    public function test_submitting_generation_places_credit_hold_on_available_balance(): void
+    {
+        $user = User::factory()->create(['balance' => '1.000000000']);
+
+        Http::fake([
+            '*/v1/generations' => Http::response([
+                'id' => 'gen_hold_test_1',
+                'object' => 'generation',
+                'status' => 'queued',
+                'prompt' => 'A serene lake',
+                'size' => '1024x1024',
+                'quality' => 'medium',
+                'rates' => [
+                    'input_text_tokens' => '5.00',
+                    'input_image_tokens' => '10.00',
+                    'output_tokens' => '40.00',
+                    'reasoning_tokens' => '12.50',
+                ],
+            ], 202),
+        ]);
+
+        $response = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'A serene lake',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+
+        $response->assertRedirect(route('generations.index'));
+
+        $gen = Generation::first();
+        $this->assertNotNull($gen->hold_amount);
+        $this->assertTrue(bccomp((string) $gen->hold_amount, '0', 9) > 0);
+
+        $freshUser = $user->fresh();
+        // Reserved balance must match hold amount
+        $this->assertSame((string) $gen->hold_amount, (string) $freshUser->reserved_balance);
+        // Available balance is balance minus reserved
+        $this->assertSame(bcsub('1.000000000', (string) $gen->hold_amount, 9), $freshUser->availableBalance());
+    }
+
+    public function test_overdraft_prevention_blocks_subsequent_submissions_when_holds_exceed_balance(): void
+    {
+        // User has $0.10 (enough for 1 medium generation (~$0.086 max), but not 2)
+        $user = User::factory()->create(['balance' => '0.100000000']);
+
+        Http::fake([
+            '*/v1/generations' => Http::response([
+                'id' => 'gen_overdraft_1',
+                'status' => 'queued',
+            ], 202),
+        ]);
+
+        // First submission succeeds and holds ~$0.07
+        $response1 = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'First generation',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+        $response1->assertRedirect(route('generations.index'));
+
+        // Second immediate submission must be blocked because hold reduced available balance
+        $response2 = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'Second generation',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+
+        $response2->assertSessionHasErrors(['balance']);
+        $this->assertSame(1, Generation::count());
+    }
+
+    public function test_api_rejection_releases_hold_and_marks_generation_failed(): void
+    {
+        $user = User::factory()->create(['balance' => '5.000000000']);
+
+        Http::fake([
+            '*/v1/generations' => Http::response([
+                'error' => [
+                    'code' => 'content_policy_violation',
+                    'message' => 'Prompt violates content policy.',
+                ],
+            ], 400),
+        ]);
+
+        $response = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'Blocked prompt [blocked]',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+
+        $response->assertRedirect(route('generations.index'));
+        $this->assertSame('failed', Generation::first()->status);
+        $this->assertSame('content_policy_violation', Generation::first()->error_code);
+
+        // Entire hold must be released
+        $this->assertSame('0.000000000', $user->fresh()->reserved_balance);
+        $this->assertSame('5.000000000', $user->fresh()->availableBalance());
+    }
+
+    public function test_retries_429_rate_limit_and_503_overloaded_with_backoff(): void
+    {
+        $user = User::factory()->create(['balance' => '5.000000000']);
+
+        Http::fake([
+            '*/v1/generations' => Http::sequence()
+                ->push(['error' => ['code' => 'rate_limited']], 429, ['Retry-After' => '1'])
+                ->push([
+                    'id' => 'gen_retry_success',
+                    'status' => 'queued',
+                ], 202),
+        ]);
+
+        $response = $this->actingAs($user)->post(route('generations.store'), [
+            'prompt' => 'Retry rate limit test',
+            'size' => '1024x1024',
+            'quality' => 'medium',
+        ]);
+
+        $response->assertRedirect(route('generations.index'));
+        $this->assertSame(1, Generation::count());
+        $this->assertSame('gen_retry_success', Generation::first()->pf_generation_id);
+    }
 }

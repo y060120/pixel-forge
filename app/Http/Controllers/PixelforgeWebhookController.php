@@ -20,34 +20,36 @@ class PixelforgeWebhookController extends Controller
         $payload = $request->getContent();
         $secret = config('services.pixelforge.webhook_secret');
 
-        // Verify webhook signature if secret is configured
-        if (! empty($secret)) {
-            $sigHeader = (string) $request->header('Pixelforge-Signature');
-            $signature = [];
+        // Strictly enforce webhook secret configuration
+        if (empty($secret)) {
+            abort(500, 'Pixelforge webhook secret is not configured.');
+        }
 
-            foreach (explode(',', $sigHeader) as $part) {
-                [$key, $value] = array_pad(explode('=', trim($part), 2), 2, '');
-                if ($key !== '') {
-                    $signature[$key] = $value;
-                }
+        $sigHeader = (string) $request->header('Pixelforge-Signature');
+        $signature = [];
+
+        foreach (explode(',', $sigHeader) as $part) {
+            [$key, $value] = array_pad(explode('=', trim($part), 2), 2, '');
+            if ($key !== '') {
+                $signature[$key] = $value;
             }
+        }
 
-            $timestamp = (int) ($signature['t'] ?? 0);
-            $providedSignature = $signature['v1'] ?? '';
+        $timestamp = (int) ($signature['t'] ?? 0);
+        $providedSignature = $signature['v1'] ?? '';
 
-            if (empty($timestamp) || empty($providedSignature)) {
-                abort(400, 'Missing Pixelforge signature parameters.');
-            }
+        if (empty($timestamp) || empty($providedSignature)) {
+            abort(400, 'Missing Pixelforge signature parameters.');
+        }
 
-            if (abs(time() - $timestamp) > 300) {
-                abort(400, 'Pixelforge signature timestamp out of tolerance.');
-            }
+        if (abs(time() - $timestamp) > 300) {
+            abort(400, 'Pixelforge signature timestamp out of tolerance.');
+        }
 
-            $expectedSignature = hash_hmac('sha256', "{$timestamp}.{$payload}", $secret);
+        $expectedSignature = hash_hmac('sha256', "{$timestamp}.{$payload}", $secret);
 
-            if (! hash_equals($expectedSignature, $providedSignature)) {
-                abort(400, 'Invalid Pixelforge signature.');
-            }
+        if (! hash_equals($expectedSignature, $providedSignature)) {
+            abort(400, 'Invalid Pixelforge signature.');
         }
 
         $event = json_decode($payload, true);
@@ -136,6 +138,7 @@ class PixelforgeWebhookController extends Controller
         // Always link pf_generation_id if missing
         if (! $generation->pf_generation_id && $pfGenId) {
             $generation->pf_generation_id = $pfGenId;
+            $generation->save();
         }
 
         // Map webhook event type to generation status if not explicitly present

@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class Generation extends Model
@@ -26,6 +27,7 @@ class Generation extends Model
         'image_url',
         'image_url_expires_at',
         'estimated_cost',
+        'hold_amount',
         'pf_cost',
         'user_cost',
         'usage',
@@ -44,6 +46,7 @@ class Generation extends Model
             'usage' => 'array',
             'rates' => 'array',
             'estimated_cost' => 'decimal:9',
+            'hold_amount' => 'decimal:9',
             'pf_cost' => 'decimal:9',
             'user_cost' => 'decimal:9',
             'image_url_expires_at' => 'datetime',
@@ -84,73 +87,110 @@ class Generation extends Model
 
     /**
      * Apply status, results, usage, and billing from Pixelforge payload data.
+     * Settle inside a database transaction with pessimistic row locking.
      *
      * @param  array<string, mixed>  $genData
      */
     public function applyPixelforgeData(array $genData, ?float $markupPercent = null): void
     {
-        $markupPercent = $markupPercent ?? (float) config('services.pixelforge.markup_percent', 25.0);
-        $status = $genData['status'] ?? null;
-
-        if ($status === 'processing' && $this->canTransitionTo('processing')) {
-            $this->status = 'processing';
-            $this->started_at = isset($genData['started_at'])
-                ? Carbon::parse($genData['started_at'])
-                : now();
-            $this->save();
-        } elseif ($status === 'succeeded') {
-            if ($this->isFinal() && $this->status !== 'succeeded') {
+        DB::transaction(function () use ($genData, $markupPercent) {
+            /** @var Generation|null $gen */
+            $gen = self::whereKey($this->id)->lockForUpdate()->first();
+            if (! $gen) {
                 return;
             }
 
-            $usage = $genData['usage'] ?? [];
-            $rates = $genData['rates'] ?? PixelforgePricing::DEFAULT_RATES;
-            $calculated = PixelforgePricing::calculateActualCost($usage, $rates, $markupPercent);
-
-            $this->status = 'succeeded';
-            $this->image_url = $genData['image_url'] ?? null;
-            $this->image_url_expires_at = isset($genData['image_url_expires_at'])
-                ? Carbon::parse($genData['image_url_expires_at'])
-                : null;
-            $this->usage = $usage;
-            $this->rates = $rates;
-            $this->pf_cost = $calculated['pf_cost'];
-            $this->user_cost = $calculated['user_cost'];
-            $this->completed_at = isset($genData['completed_at'])
-                ? Carbon::parse($genData['completed_at'])
-                : now();
-            $this->error_code = null;
-            $this->error_message = null;
-            $this->save();
-
-            // Deduct credits from user if not charged yet
-            $alreadyCharged = $this->user->creditTransactions()
-                ->where('reference_id', (string) $this->id)
-                ->where('type', 'generation_charge')
-                ->exists();
-
-            if (! $alreadyCharged && bccomp((string) $this->user_cost, '0', 9) > 0) {
-                $this->user->deductCredits(
-                    $this->user_cost,
-                    (string) $this->id,
-                    'Image generation: '.Str::limit($this->prompt, 40)
-                );
-            }
-        } elseif ($status === 'failed') {
-            if ($this->isFinal()) {
+            // Both succeeded and failed states are fully final; do not allow re-settlement or regression
+            if ($gen->isFinal()) {
                 return;
             }
 
-            $error = $genData['error'] ?? [];
-            $this->status = 'failed';
-            $this->error_code = $error['code'] ?? 'generation_failed';
-            $this->error_message = $error['message'] ?? 'Image generation failed';
-            $this->completed_at = isset($genData['completed_at'])
-                ? Carbon::parse($genData['completed_at'])
-                : now();
-            $this->pf_cost = '0.000000000';
-            $this->user_cost = '0.000000000';
-            $this->save();
-        }
+            $markupPercent = $markupPercent ?? (float) config('services.pixelforge.markup_percent', 25.0);
+            $status = $genData['status'] ?? null;
+
+            if ($status === 'processing') {
+                if ($gen->canTransitionTo('processing')) {
+                    $gen->status = 'processing';
+                    $gen->started_at = isset($genData['started_at'])
+                        ? Carbon::parse($genData['started_at'])
+                        : now();
+                    $gen->save();
+                    $this->fill($gen->getAttributes());
+                }
+
+                return;
+            }
+
+            if ($status === 'succeeded') {
+                $usage = $genData['usage'] ?? [];
+                $rates = $genData['rates'] ?? PixelforgePricing::DEFAULT_RATES;
+                $calculated = PixelforgePricing::calculateActualCost($usage, $rates, $markupPercent);
+
+                $gen->status = 'succeeded';
+                $gen->image_url = $genData['image_url'] ?? null;
+                $gen->image_url_expires_at = isset($genData['image_url_expires_at'])
+                    ? Carbon::parse($genData['image_url_expires_at'])
+                    : null;
+                $gen->usage = $usage;
+                $gen->rates = $rates;
+                $gen->pf_cost = $calculated['pf_cost'];
+                $gen->user_cost = $calculated['user_cost'];
+                $gen->completed_at = isset($genData['completed_at'])
+                    ? Carbon::parse($genData['completed_at'])
+                    : now();
+                $gen->error_code = null;
+                $gen->error_message = null;
+                $gen->save();
+
+                // Settle user hold and charge under user lock
+                /** @var User|null $user */
+                $user = User::whereKey($gen->user_id)->lockForUpdate()->first();
+                if ($user) {
+                    $holdAmount = (string) ($gen->hold_amount ?? '0.000000000');
+                    if (bccomp($holdAmount, '0', 9) > 0) {
+                        $user->releaseCredits($holdAmount);
+                    }
+
+                    if (bccomp((string) $gen->user_cost, '0', 9) > 0) {
+                        $user->deductCredits(
+                            $gen->user_cost,
+                            (string) $gen->id,
+                            'Image generation: '.Str::limit($gen->prompt, 40)
+                        );
+                    }
+                }
+
+                $this->fill($gen->getAttributes());
+
+                return;
+            }
+
+            if ($status === 'failed') {
+                $error = $genData['error'] ?? [];
+                $gen->status = 'failed';
+                $gen->error_code = $error['code'] ?? 'generation_failed';
+                $gen->error_message = $error['message'] ?? 'Image generation failed';
+                $gen->completed_at = isset($genData['completed_at'])
+                    ? Carbon::parse($genData['completed_at'])
+                    : now();
+                $gen->pf_cost = '0.000000000';
+                $gen->user_cost = '0.000000000';
+                $gen->save();
+
+                // Release entire hold on failure (zero cost guarantee)
+                /** @var User|null $user */
+                $user = User::whereKey($gen->user_id)->lockForUpdate()->first();
+                if ($user) {
+                    $holdAmount = (string) ($gen->hold_amount ?? '0.000000000');
+                    if (bccomp($holdAmount, '0', 9) > 0) {
+                        $user->releaseCredits($holdAmount);
+                    }
+                }
+
+                $this->fill($gen->getAttributes());
+
+                return;
+            }
+        });
     }
 }

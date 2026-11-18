@@ -120,7 +120,9 @@ const maxPotentialCost = computed(() => {
 });
 
 const currentBalance = computed(() => {
-    return parseFloat(user.value?.balance || 0);
+    const rawBalance = parseFloat(user.value?.balance || 0);
+    const reserved = parseFloat(user.value?.reserved_balance || 0);
+    return Math.max(0, rawBalance - reserved);
 });
 
 const canAfford = computed(() => {
@@ -181,9 +183,12 @@ const pollUpdates = async () => {
             }
         });
 
-        // Update user balance if changed
+        // Update user balance and hold if changed
         if (res.data.user_balance !== undefined && page.props.auth.user) {
             page.props.auth.user.balance = res.data.user_balance;
+        }
+        if (res.data.reserved_balance !== undefined && page.props.auth.user) {
+            page.props.auth.user.reserved_balance = res.data.reserved_balance;
         }
 
         // If no active generations left, stop fast polling

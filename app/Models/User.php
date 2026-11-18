@@ -24,6 +24,7 @@ class User extends Authenticatable
         'email',
         'password',
         'balance',
+        'reserved_balance',
         'is_admin',
     ];
 
@@ -48,6 +49,7 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'balance' => 'decimal:9',
+            'reserved_balance' => 'decimal:9',
             'is_admin' => 'boolean',
         ];
     }
@@ -63,11 +65,62 @@ class User extends Authenticatable
     }
 
     /**
-     * Check if user has at least the required amount of credits.
+     * Get user's available balance (balance minus reserved holds).
+     */
+    public function availableBalance(): string
+    {
+        $reserved = (string) ($this->reserved_balance ?? '0.000000000');
+
+        return bcsub((string) $this->balance, $reserved, 9);
+    }
+
+    /**
+     * Check if user has at least the required amount of available credits.
      */
     public function hasSufficientBalance(string $requiredAmount): bool
     {
-        return bccomp((string) $this->balance, (string) $requiredAmount, 9) >= 0;
+        return bccomp($this->availableBalance(), (string) $requiredAmount, 9) >= 0;
+    }
+
+    /**
+     * Reserve credits for a pending generation.
+     */
+    public function reserveCredits(string $amount): void
+    {
+        DB::transaction(function () use ($amount) {
+            $user = self::whereKey($this->id)->lockForUpdate()->first();
+            if (! $user) {
+                return;
+            }
+
+            $currentReserved = (string) ($user->reserved_balance ?? '0.000000000');
+            $newReserved = bcadd($currentReserved, (string) $amount, 9);
+
+            $user->update(['reserved_balance' => $newReserved]);
+            $this->reserved_balance = $newReserved;
+        });
+    }
+
+    /**
+     * Release reserved credits hold.
+     */
+    public function releaseCredits(string $amount): void
+    {
+        DB::transaction(function () use ($amount) {
+            $user = self::whereKey($this->id)->lockForUpdate()->first();
+            if (! $user) {
+                return;
+            }
+
+            $currentReserved = (string) ($user->reserved_balance ?? '0.000000000');
+            $newReserved = bcsub($currentReserved, (string) $amount, 9);
+            if (bccomp($newReserved, '0', 9) < 0) {
+                $newReserved = '0.000000000';
+            }
+
+            $user->update(['reserved_balance' => $newReserved]);
+            $this->reserved_balance = $newReserved;
+        });
     }
 
     /**
@@ -76,7 +129,7 @@ class User extends Authenticatable
     public function addCredits(string $amount, ?string $referenceId = null, string $description = 'Credit purchase'): CreditTransaction
     {
         return DB::transaction(function () use ($amount, $referenceId, $description) {
-            $user = self::where('id', $this->id)->lockForUpdate()->first();
+            $user = self::whereKey($this->id)->lockForUpdate()->first();
             $newBalance = bcadd((string) $user->balance, (string) $amount, 9);
 
             $user->update(['balance' => $newBalance]);
@@ -94,14 +147,25 @@ class User extends Authenticatable
 
     /**
      * Deduct credits from user's balance and record transaction.
+     * Prevents duplicate charges for the same reference ID.
      */
-    public function deductCredits(string $amount, ?string $referenceId = null, string $description = 'Generation charge'): CreditTransaction
+    public function deductCredits(string $amount, ?string $referenceId = null, string $description = 'Generation charge'): ?CreditTransaction
     {
         return DB::transaction(function () use ($amount, $referenceId, $description) {
-            $user = self::where('id', $this->id)->lockForUpdate()->first();
+            if ($referenceId) {
+                $existing = $this->creditTransactions()
+                    ->where('type', 'generation_charge')
+                    ->where('reference_id', $referenceId)
+                    ->first();
+
+                if ($existing) {
+                    return $existing;
+                }
+            }
+
+            $user = self::whereKey($this->id)->lockForUpdate()->first();
             $newBalance = bcsub((string) $user->balance, (string) $amount, 9);
 
-            // Prevent negative balance from drifting below zero if needed, but recorded accurately
             $user->update(['balance' => $newBalance]);
             $this->balance = $newBalance;
 

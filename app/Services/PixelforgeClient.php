@@ -95,37 +95,56 @@ class PixelforgeClient
         while ($attempt <= $maxRetries) {
             $attempt++;
 
-            $response = Http::timeout($this->timeout)
-                ->withToken($this->apiKey)
-                ->withHeaders([
-                    'Idempotency-Key' => $idempotencyKey,
-                    'Accept' => 'application/json',
-                ])
-                ->post("{$this->baseUrl}/generations", $payload);
+            try {
+                $response = Http::timeout($this->timeout)
+                    ->withToken($this->apiKey)
+                    ->withHeaders([
+                        'Idempotency-Key' => $idempotencyKey,
+                        'Accept' => 'application/json',
+                    ])
+                    ->post("{$this->baseUrl}/generations", $payload);
 
-            if ($response->status() === 202) {
+                if ($response->status() === 202) {
+                    return [
+                        'success' => true,
+                        'status' => 202,
+                        'data' => $response->json(),
+                        'idempotency_key' => $idempotencyKey,
+                    ];
+                }
+
+                // If overloaded (503) or rate limited (429), respect Retry-After and retry
+                if (in_array($response->status(), [429, 503], true) && $attempt <= $maxRetries) {
+                    $retryAfterHeader = $response->header('Retry-After');
+                    $retryAfter = is_numeric($retryAfterHeader) ? (int) $retryAfterHeader : 2;
+                    sleep(min(max(1, $retryAfter), 5));
+
+                    continue;
+                }
+
                 return [
-                    'success' => true,
-                    'status' => 202,
-                    'data' => $response->json(),
+                    'success' => false,
+                    'status' => $response->status(),
+                    'error' => $this->parseError($response),
                     'idempotency_key' => $idempotencyKey,
                 ];
+            } catch (\Throwable $e) {
+                Log::warning("Pixelforge createGeneration attempt {$attempt} failed: ".$e->getMessage());
+
+                if ($attempt > $maxRetries) {
+                    return [
+                        'success' => false,
+                        'status' => 0,
+                        'error' => [
+                            'code' => 'connection_error',
+                            'message' => 'Connection to Pixelforge failed: '.$e->getMessage(),
+                        ],
+                        'idempotency_key' => $idempotencyKey,
+                    ];
+                }
+
+                sleep(1);
             }
-
-            // If overloaded (503), check Retry-After and retry if within limit
-            if ($response->status() === 503 && $attempt <= $maxRetries) {
-                $retryAfter = (int) ($response->header('Retry-After') ?: 2);
-                sleep(min($retryAfter, 5));
-
-                continue;
-            }
-
-            return [
-                'success' => false,
-                'status' => $response->status(),
-                'error' => $this->parseError($response),
-                'idempotency_key' => $idempotencyKey,
-            ];
         }
 
         return [

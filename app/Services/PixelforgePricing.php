@@ -44,11 +44,12 @@ class PixelforgePricing
     /**
      * Calculate exact actual cost from reported usage and rates.
      * Failed generations cost $0.00.
+     * Costs are truncated to 9 decimal places using BCMath.
      *
      * @param  array<string, int|numeric-string>  $usage
      * @param  array<string, string>|null  $rates
      */
-    public static function calculateActualCost(array $usage, ?array $rates = null, float $markupPercent = 25.0): array
+    public static function calculateActualCost(array $usage, ?array $rates = null, int|float|string $markupPercent = '25.0'): array
     {
         $rates = array_merge(self::DEFAULT_RATES, $rates ?? []);
 
@@ -87,6 +88,7 @@ class PixelforgePricing
     /**
      * Estimate cost upfront before submission.
      * Computes expected, minimum, and maximum bounds.
+     * Costs are truncated to 9 decimal places using BCMath.
      *
      * @param  array<string, string>|null  $rates
      */
@@ -96,7 +98,7 @@ class PixelforgePricing
         string $quality = 'medium',
         int $referenceImageCount = 0,
         ?array $rates = null,
-        float $markupPercent = 25.0
+        int|float|string $markupPercent = '25.0'
     ): array {
         $rates = array_merge(self::DEFAULT_RATES, $rates ?? []);
         $size = in_array($size, ['1024x1024', '1536x1024', '1024x1536'], true) ? $size : '1024x1024';
